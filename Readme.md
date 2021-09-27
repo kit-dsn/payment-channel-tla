@@ -11,7 +11,7 @@ After the HTLC has been resolved or when it times out, the payment channel is up
 [TransactionIdOracle.tla](TransactionIdOracle.tla) includes helpers to assign unique transaction IDs to each transaction.
 
 To check the specification using TLC, run
-```
+```bash
 java -cp /path/to/tla2tools.jar tlc2.TLC PaymentChannel.toolbox/Model_1/MC.tla -workers auto -deadlock
 
 ```

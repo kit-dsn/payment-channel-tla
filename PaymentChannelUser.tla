@@ -214,6 +214,11 @@ PublishFundingTransaction ==
 NoteThatFundingTransactionPublished ==
     /\ State = "open-sent-commit"
     /\ State' = "open-funding-pub"
+    (***********************************************************************
+    This verifies that the funding transaction has been published on the blockchain.
+    See CVE-2019-12998 / CVE-2019-12999 / CVE-2019-13000 and
+    https://lists.linuxfoundation.org/pipermail/lightning-dev/2019-September/002174.html
+     ***********************************************************************)
     /\ \E tx \in LedgerTx : tx.id = Vars.fundingTxId
     /\ UNCHANGED <<Message, Vars, Inventory, Balance, LedgerTx, TIOUsedTransactionIds, PendingBalance>>
     /\ UNCHANGED UnchangedVars
@@ -261,28 +266,28 @@ Bijection(S,T) == Injection(S,T) \cap Surjection(S,T)
     
 CreateHTLCTransactions(commitmentTransaction, newHTLCs, oldHTLCs) ==
     LET HTLCs == (newHTLCs \cup HTLCsByStates({"SENT-COMMIT", "PENDING-COMMIT", "COMMITTED", "SENT-REMOVE", "FULFILLED"})) \ oldHTLCs
-    IN  LET NewTransactionIds == TIO!GetNewTransactionIds(Cardinality(HTLCs), {commitmentTransaction.id})
-        IN  LET IdForHTLC == CHOOSE bijection \in Bijection(HTLCs, NewTransactionIds) : TRUE
-            IN  { LET htlcTransactionId == IdForHTLC[htlc]
-                  IN [id |-> htlcTransactionId,
-                       inputs |-> {[parentId |-> commitmentTransaction.id,
-                                    outputId |-> (CHOOSE output \in commitmentTransaction.outputs :
-                                                        (\E condition \in output.conditions :
-                                                                /\ condition.type \in {SingleSigHashLock, AllSigHashLock}
-                                                                /\ condition.data.hash = htlc.hash )
-                                                  ).outputId,
-                                    witness |-> [signatures |-> {Vars.MyKey}]]},
-                       outputs |-> {[parentId |-> htlcTransactionId,
-                                     outputId |-> 1,
-                                     amount |-> htlc.amount,
-                                     conditions |-> {
-                                        [Ledger!SingleSignatureCondition(Vars.OtherKey) EXCEPT !.relTimelock = 5],
-                                        Ledger!AllSignaturesCondition({Vars.MyKey, Vars.OtherNewRKey})
-                                     }
-                                    ]
-                                   }
-                      ]
-                    : htlc \in HTLCs}
+        NewTransactionIds == TIO!GetNewTransactionIds(Cardinality(HTLCs), {commitmentTransaction.id})
+        IdForHTLC == CHOOSE bijection \in Bijection(HTLCs, NewTransactionIds) : TRUE
+    IN  { LET htlcTransactionId == IdForHTLC[htlc]
+          IN  [id |-> htlcTransactionId,
+           inputs |-> {[parentId |-> commitmentTransaction.id,
+                        outputId |-> (CHOOSE output \in commitmentTransaction.outputs :
+                                            (\E condition \in output.conditions :
+                                                    /\ condition.type \in {SingleSigHashLock, AllSigHashLock}
+                                                    /\ condition.data.hash = htlc.hash )
+                                      ).outputId,
+                        witness |-> [signatures |-> {Vars.MyKey}]]},
+           outputs |-> {[parentId |-> htlcTransactionId,
+                         outputId |-> 1,
+                         amount |-> htlc.amount,
+                         conditions |-> {
+                            [Ledger!SingleSignatureCondition(Vars.OtherKey) EXCEPT !.relTimelock = 5],
+                            Ledger!AllSignaturesCondition({Vars.MyKey, Vars.OtherNewRKey})
+                         }
+                        ]
+                       }
+          ]
+        : htlc \in HTLCs}
     
 SendSignedCommitmentWithHTLC ==
     /\ \/ State = "update-commitment-received" /\ State' = "update-commitment-signed-received"
@@ -291,50 +296,51 @@ SendSignedCommitmentWithHTLC ==
     /\ \E HTLCsToAdd \in SUBSET({htlcData \in HTLCsByStates({"NEW", "RECV-COMMIT"}) : LedgerTime < htlcData.absTimelock}) :
       /\ Cardinality(HTLCsToAdd) > 0
       /\ LET commitTxId == TIO!GetNewTransactionId
-         IN LET htlcAmountToMe == Ledger!SumAmounts(HTLCsToAdd \cap Vars.IncomingHTLCs)
-            IN LET htlcAmountToOther == Ledger!SumAmounts(HTLCsToAdd \cap Vars.OutgoingHTLCs)
-               IN LET outputToMe == CHOOSE output \in Vars.CurrentOtherCommitTX.outputs : output.outputId = 1
-                  IN LET outputToOther == CHOOSE output \in Vars.CurrentOtherCommitTX.outputs : output.outputId = 2
-                     IN /\ outputToMe.amount >= htlcAmountToOther
-                        /\ outputToOther.amount >= htlcAmountToMe
-                        /\ LET newOutputIds == CHOOSE set \in SUBSET(IDs \ {output.outputId : output \in Vars.CurrentOtherCommitTX.outputs}) : Cardinality(set) = Cardinality(HTLCsToAdd)
-                           IN LET IdForHTLCOutput == CHOOSE bijection \in Bijection(HTLCsToAdd, newOutputIds) : TRUE
-                              IN LET newCommit == [Vars.CurrentOtherCommitTX
-                                             EXCEPT !.id = commitTxId,
-                                                    !.outputs = {[output EXCEPT !.parentId = commitTxId, !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey)] : output \in (@ \ {outputToMe, outputToOther})}
-                                                                \cup {[outputToMe EXCEPT !.parentId = commitTxId,
-                                                                                         !.amount = @ - htlcAmountToOther,
-                                                                                         !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey) ]}
-                                                                \cup {[outputToOther EXCEPT !.parentId = commitTxId,
-                                                                                            !.amount = @ - htlcAmountToMe,
-                                                                                            !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey) ]}
-                                                                \cup {[ parentId |-> commitTxId,
-                                                                        outputId |-> IdForHTLCOutput[htlcData],
-                                                                        amount |-> htlcData.amount,
-                                                                        conditions |-> {
-                                                                            (IF htlcData \in Vars.OutgoingHTLCs
-                                                                                THEN Ledger!AllSigHashLockCondition({Vars.MyKey, Vars.OtherKey}, htlcData.hash) \* spent by HTLC success transaction
-                                                                                ELSE Ledger!SingleSigHashLockCondition(Vars.MyKey, htlcData.hash)),
-                                                                            (IF htlcData \in Vars.OutgoingHTLCs
-                                                                                THEN [Ledger!SingleSignatureCondition(Vars.MyKey) EXCEPT !.absTimelock = htlcData.absTimelock]
-                                                                                ELSE [Ledger!AllSignaturesCondition({Vars.MyKey, Vars.OtherKey}) EXCEPT !.absTimelock = htlcData.absTimelock]), \* spent by HTLC timeout transaction
-                                                                            Ledger!AllSignaturesCondition({Vars.MyKey, Vars.OtherNewRKey})
-                                                                        }
-                                                                     ] : htlcData \in HTLCsToAdd}
-                                            ]
-                                 IN LET HTLCTransactions == CreateHTLCTransactions(newCommit, HTLCsToAdd, {})
-                                    IN /\ TIO!MarkMultipleAsUsed({commitTxId} \cup {tx.id : tx \in HTLCTransactions})
-                                       /\ Message' = [EmptyMessage EXCEPT !.recipient = OtherName,
-                                                                       !.type = "NewSignedCommitment",
-                                                                       !.data.transaction = newCommit,
-                                                                       !.data.htlcTransactions = HTLCTransactions] 
-                                       /\ Vars' = [Vars EXCEPT !.CurrentOtherCommitTX = newCommit,
-                                                            !.CurrentOtherHTLCTransactionIds = {tx.id : tx \in HTLCTransactions},
-                                                            !.PendingOldOtherCommitTxIds = @ \cup {Vars.CurrentOtherCommitTX.id} \cup Vars.CurrentOtherHTLCTransactionIds,
-                                                            !.OutgoingHTLCs = (@ \ (HTLCsToAdd \cap Vars.OutgoingHTLCs)) \cup {[htlcData EXCEPT !.state = IF htlcData.state = "NEW" THEN "SENT-COMMIT" ELSE "PENDING-COMMIT"] : htlcData \in (HTLCsToAdd \cap Vars.OutgoingHTLCs)},
-                                                            !.IncomingHTLCs = (@ \ (HTLCsToAdd \cap Vars.IncomingHTLCs)) \cup {[htlcData EXCEPT !.state = IF htlcData.state = "NEW" THEN "SENT-COMMIT" ELSE "PENDING-COMMIT"] : htlcData \in (HTLCsToAdd \cap Vars.IncomingHTLCs)},
-                                                            !.OtherOldRKey = Vars.OtherRKey,
-                                                            !.OtherRKey = Vars.OtherNewRKey]
+             htlcAmountToMe == Ledger!SumAmounts(HTLCsToAdd \cap Vars.IncomingHTLCs)
+             htlcAmountToOther == Ledger!SumAmounts(HTLCsToAdd \cap Vars.OutgoingHTLCs)
+             outputToMe == CHOOSE output \in Vars.CurrentOtherCommitTX.outputs : output.outputId = 1
+             outputToOther == CHOOSE output \in Vars.CurrentOtherCommitTX.outputs : output.outputId = 2
+         IN /\ outputToMe.amount >= htlcAmountToOther
+            /\ outputToOther.amount >= htlcAmountToMe
+            /\ LET newOutputIds == CHOOSE set \in SUBSET(IDs \ {output.outputId : output \in Vars.CurrentOtherCommitTX.outputs}) : Cardinality(set) = Cardinality(HTLCsToAdd)
+                   IdForHTLCOutput == CHOOSE bijection \in Bijection(HTLCsToAdd, newOutputIds) : TRUE
+                   newCommit ==
+                        [Vars.CurrentOtherCommitTX
+                         EXCEPT !.id = commitTxId,
+                                !.outputs = {[output EXCEPT !.parentId = commitTxId, !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey)] : output \in (@ \ {outputToMe, outputToOther})}
+                                            \cup {[outputToMe EXCEPT !.parentId = commitTxId,
+                                                                     !.amount = @ - htlcAmountToOther,
+                                                                     !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey) ]}
+                                            \cup {[outputToOther EXCEPT !.parentId = commitTxId,
+                                                                        !.amount = @ - htlcAmountToMe,
+                                                                        !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey) ]}
+                                            \cup {[ parentId |-> commitTxId,
+                                                    outputId |-> IdForHTLCOutput[htlcData],
+                                                    amount |-> htlcData.amount,
+                                                    conditions |-> {
+                                                        (IF htlcData \in Vars.OutgoingHTLCs
+                                                            THEN Ledger!AllSigHashLockCondition({Vars.MyKey, Vars.OtherKey}, htlcData.hash) \* spent by HTLC success transaction
+                                                            ELSE Ledger!SingleSigHashLockCondition(Vars.MyKey, htlcData.hash)),
+                                                        (IF htlcData \in Vars.OutgoingHTLCs
+                                                            THEN [Ledger!SingleSignatureCondition(Vars.MyKey) EXCEPT !.absTimelock = htlcData.absTimelock]
+                                                            ELSE [Ledger!AllSignaturesCondition({Vars.MyKey, Vars.OtherKey}) EXCEPT !.absTimelock = htlcData.absTimelock]), \* spent by HTLC timeout transaction
+                                                        Ledger!AllSignaturesCondition({Vars.MyKey, Vars.OtherNewRKey})
+                                                    }
+                                                 ] : htlcData \in HTLCsToAdd}
+                        ]
+                   HTLCTransactions == CreateHTLCTransactions(newCommit, HTLCsToAdd, {})
+               IN /\ TIO!MarkMultipleAsUsed({commitTxId} \cup {tx.id : tx \in HTLCTransactions})
+                  /\ Message' = [EmptyMessage EXCEPT !.recipient = OtherName,
+                                                     !.type = "NewSignedCommitment",
+                                                     !.data.transaction = newCommit,
+                                                     !.data.htlcTransactions = HTLCTransactions] 
+                  /\ Vars' = [Vars EXCEPT !.CurrentOtherCommitTX = newCommit,
+                                          !.CurrentOtherHTLCTransactionIds = {tx.id : tx \in HTLCTransactions},
+                                          !.PendingOldOtherCommitTxIds = @ \cup {Vars.CurrentOtherCommitTX.id} \cup Vars.CurrentOtherHTLCTransactionIds,
+                                          !.OutgoingHTLCs = (@ \ (HTLCsToAdd \cap Vars.OutgoingHTLCs)) \cup {[htlcData EXCEPT !.state = IF htlcData.state = "NEW" THEN "SENT-COMMIT" ELSE "PENDING-COMMIT"] : htlcData \in (HTLCsToAdd \cap Vars.OutgoingHTLCs)},
+                                          !.IncomingHTLCs = (@ \ (HTLCsToAdd \cap Vars.IncomingHTLCs)) \cup {[htlcData EXCEPT !.state = IF htlcData.state = "NEW" THEN "SENT-COMMIT" ELSE "PENDING-COMMIT"] : htlcData \in (HTLCsToAdd \cap Vars.IncomingHTLCs)},
+                                          !.OtherOldRKey = Vars.OtherRKey,
+                                          !.OtherRKey = Vars.OtherNewRKey]
     /\ UNCHANGED <<Inventory, LedgerTx, LedgerTime, PendingBalance, Balance>>
     /\ UNCHANGED UnchangedVars
     
@@ -352,11 +358,11 @@ ReceiveSignedCommitment == \* this is a more general version of ReceiveCommitTra
     /\ Inventory' = [Inventory EXCEPT !.transactions = @ \cup {Message.data.transaction} \cup Message.data.htlcTransactions]
     /\ Message' = EmptyMessage
     /\ LET lastCommitmentTx == CHOOSE tx \in Inventory.transactions : tx.id = Vars.LatestCommitTransactionId
-       IN LET newlyCommittedHTLCs == {htlc \in HTLCsByStates({"NEW", "SENT-COMMIT"}) : htlc.hash \in HashesInCommitTransaction(Message.data.transaction) /\ ~htlc.hash \in HashesInCommitTransaction(lastCommitmentTx)}
-          IN   Vars' = [Vars EXCEPT !.LatestCommitTransactionId = Message.data.transaction.id,
-                                    !.CommitmentTxIds = @ \cup {Message.data.transaction.id},
-                                    !.OutgoingHTLCs = (@ \ newlyCommittedHTLCs) \cup {[htlc EXCEPT !.state = IF htlc.state = "NEW" THEN "RECV-COMMIT" ELSE "PENDING-COMMIT"] : htlc \in (newlyCommittedHTLCs \cap Vars.OutgoingHTLCs)},
-                                    !.IncomingHTLCs = (@ \ newlyCommittedHTLCs) \cup {[htlc EXCEPT !.state = IF htlc.state = "NEW" THEN "RECV-COMMIT" ELSE "PENDING-COMMIT"] : htlc \in (newlyCommittedHTLCs \cap Vars.IncomingHTLCs)}]
+           newlyCommittedHTLCs == {htlc \in HTLCsByStates({"NEW", "SENT-COMMIT"}) : htlc.hash \in HashesInCommitTransaction(Message.data.transaction) /\ ~htlc.hash \in HashesInCommitTransaction(lastCommitmentTx)}
+       IN   Vars' = [Vars EXCEPT !.LatestCommitTransactionId = Message.data.transaction.id,
+                                 !.CommitmentTxIds = @ \cup {Message.data.transaction.id},
+                                 !.OutgoingHTLCs = (@ \ newlyCommittedHTLCs) \cup {[htlc EXCEPT !.state = IF htlc.state = "NEW" THEN "RECV-COMMIT" ELSE "PENDING-COMMIT"] : htlc \in (newlyCommittedHTLCs \cap Vars.OutgoingHTLCs)},
+                                 !.IncomingHTLCs = (@ \ newlyCommittedHTLCs) \cup {[htlc EXCEPT !.state = IF htlc.state = "NEW" THEN "RECV-COMMIT" ELSE "PENDING-COMMIT"] : htlc \in (newlyCommittedHTLCs \cap Vars.IncomingHTLCs)}]
     /\ UNCHANGED <<LedgerTx, TIOUsedTransactionIds, Balance, PendingBalance>>
     /\ UNCHANGED UnchangedVars
     
@@ -380,13 +386,13 @@ ReceiveRevocationKey ==
     /\ Message.data.rSecretKey = Vars.OtherOldRKey
     /\ Inventory' = [Inventory EXCEPT !.keys = @ \cup {Message.data.rSecretKey}]
     /\ LET lastCommitmentTx == CHOOSE tx \in Inventory.transactions : tx.id = Vars.LatestCommitTransactionId
-       IN LET nowCommittedHTLCs == HTLCsByStates({"PENDING-COMMIT"})
-          IN LET nowRemovedHTLCs == {htlc \in HTLCsByStates({"SENT-REMOVE"}) :
+           nowCommittedHTLCs == HTLCsByStates({"PENDING-COMMIT"})
+           nowRemovedHTLCs == {htlc \in HTLCsByStates({"SENT-REMOVE"}) :
                                         ~ htlc.hash \in (HashesInCommitTransaction(lastCommitmentTx) \cup HashesInCommitTransaction(Vars.CurrentOtherCommitTX))}
-             IN Vars' = [Vars EXCEPT !.OldOtherCommitTXIds = @ \cup Vars.PendingOldOtherCommitTxIds,
-                                     !.PendingOldOtherCommitTxIds = {},
-                                     !.OutgoingHTLCs = (@ \ (nowCommittedHTLCs \cup nowRemovedHTLCs)) \cup {[htlc EXCEPT !.state = "COMMITTED"] : htlc \in (nowCommittedHTLCs \cap Vars.OutgoingHTLCs)},
-                                     !.IncomingHTLCs = (@ \ (nowCommittedHTLCs \cup nowRemovedHTLCs)) \cup {[htlc EXCEPT !.state = "COMMITTED"] : htlc \in (nowCommittedHTLCs \cap Vars.IncomingHTLCs)}]
+       IN Vars' = [Vars EXCEPT !.OldOtherCommitTXIds = @ \cup Vars.PendingOldOtherCommitTxIds,
+                               !.PendingOldOtherCommitTxIds = {},
+                               !.OutgoingHTLCs = (@ \ (nowCommittedHTLCs \cup nowRemovedHTLCs)) \cup {[htlc EXCEPT !.state = "COMMITTED"] : htlc \in (nowCommittedHTLCs \cap Vars.OutgoingHTLCs)},
+                               !.IncomingHTLCs = (@ \ (nowCommittedHTLCs \cup nowRemovedHTLCs)) \cup {[htlc EXCEPT !.state = "COMMITTED"] : htlc \in (nowCommittedHTLCs \cap Vars.IncomingHTLCs)}]
     /\ UNCHANGED <<Balance, PendingBalance, LedgerTx, TIOUsedTransactionIds>>
     /\ UNCHANGED UnchangedVars
 
@@ -397,34 +403,34 @@ SendSignedCommitmentWithoutHTLC ==
     /\ \E HTLCsToRemove \in SUBSET(HTLCsByStates({"FULFILLED"})) :
       /\ Cardinality(HTLCsToRemove) > 0
       /\ LET commitTxId == TIO!GetNewTransactionId
-         IN LET htlcAmountForMe == Ledger!SumAmounts(HTLCsToRemove \cap Vars.IncomingHTLCs)
-            IN LET htlcAmountForOther == Ledger!SumAmounts(HTLCsToRemove \cap Vars.OutgoingHTLCs)
-               IN LET outputToMe == CHOOSE output \in Vars.CurrentOtherCommitTX.outputs : output.outputId = 1
-                  IN LET outputToOther == CHOOSE output \in Vars.CurrentOtherCommitTX.outputs : output.outputId = 2
-                     IN LET htlcOutputsToRemove == { output \in Vars.CurrentOtherCommitTX.outputs : (\E condition \in output.conditions : condition.type \in {SingleSigHashLock, AllSigHashLock} /\ (\E htlc \in HTLCsToRemove : condition.data.hash = htlc.hash)) } 
-                        IN LET newCommit == [Vars.CurrentOtherCommitTX
-                                 EXCEPT !.id = commitTxId,
-                                        !.outputs = {[output EXCEPT !.parentId = commitTxId, !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey)] : output \in (@ \ (htlcOutputsToRemove \cup {outputToMe, outputToOther}))}
-                                                    \cup {[outputToMe EXCEPT !.parentId = commitTxId,
-                                                                             !.amount = @ + htlcAmountForMe,
-                                                                             !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey) ]}
-                                                    \cup {[outputToOther EXCEPT !.parentId = commitTxId,
-                                                                                !.amount = @ + htlcAmountForOther,
-                                                                                !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey) ]}
-                                ]
-                           IN LET HTLCTransactions == CreateHTLCTransactions(newCommit, {}, HTLCsToRemove \cup HTLCsByStates({"SENT-REMOVE"}))
-                              IN /\ TIO!MarkMultipleAsUsed({commitTxId} \cup {tx.id : tx \in HTLCTransactions})
-                                 /\ Message' = [EmptyMessage EXCEPT !.recipient = OtherName,
-                                                                 !.type = "NewSignedCommitment2",
-                                                                 !.data.transaction = newCommit,
-                                                                 !.data.htlcTransactions = HTLCTransactions]
-                                 /\ Vars' = [Vars EXCEPT !.CurrentOtherCommitTX = newCommit,
-                                                         !.CurrentOtherHTLCTransactionIds = {tx.id : tx \in HTLCTransactions},
-                                                         !.PendingOldOtherCommitTxIds = @ \cup {Vars.CurrentOtherCommitTX.id} \cup Vars.CurrentOtherHTLCTransactionIds,
-                                                         !.OutgoingHTLCs = (@ \ HTLCsToRemove) \cup {[htlc EXCEPT !.state = "SENT-REMOVE"] : htlc \in (HTLCsToRemove \cap Vars.OutgoingHTLCs)},
-                                                         !.IncomingHTLCs = (@ \ HTLCsToRemove) \cup {[htlc EXCEPT !.state = "SENT-REMOVE"] : htlc \in (HTLCsToRemove \cap Vars.IncomingHTLCs)},
-                                                         !.OtherOldRKey = Vars.OtherRKey,
-                                                         !.OtherRKey = Vars.OtherNewRKey]
+             htlcAmountForMe == Ledger!SumAmounts(HTLCsToRemove \cap Vars.IncomingHTLCs)
+             htlcAmountForOther == Ledger!SumAmounts(HTLCsToRemove \cap Vars.OutgoingHTLCs)
+             outputToMe == CHOOSE output \in Vars.CurrentOtherCommitTX.outputs : output.outputId = 1
+             outputToOther == CHOOSE output \in Vars.CurrentOtherCommitTX.outputs : output.outputId = 2
+             htlcOutputsToRemove == { output \in Vars.CurrentOtherCommitTX.outputs : (\E condition \in output.conditions : condition.type \in {SingleSigHashLock, AllSigHashLock} /\ (\E htlc \in HTLCsToRemove : condition.data.hash = htlc.hash)) } 
+             newCommit == [Vars.CurrentOtherCommitTX
+                 EXCEPT !.id = commitTxId,
+                        !.outputs = {[output EXCEPT !.parentId = commitTxId, !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey)] : output \in (@ \ (htlcOutputsToRemove \cup {outputToMe, outputToOther}))}
+                                    \cup {[outputToMe EXCEPT !.parentId = commitTxId,
+                                                             !.amount = @ + htlcAmountForMe,
+                                                             !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey) ]}
+                                    \cup {[outputToOther EXCEPT !.parentId = commitTxId,
+                                                                !.amount = @ + htlcAmountForOther,
+                                                                !.conditions = UpdateRKeyInConditions(@, Vars.OtherRKey, Vars.OtherNewRKey) ]}
+                ]
+             HTLCTransactions == CreateHTLCTransactions(newCommit, {}, HTLCsToRemove \cup HTLCsByStates({"SENT-REMOVE"}))
+         IN /\ TIO!MarkMultipleAsUsed({commitTxId} \cup {tx.id : tx \in HTLCTransactions})
+            /\ Message' = [EmptyMessage EXCEPT !.recipient = OtherName,
+                                               !.type = "NewSignedCommitment2",
+                                               !.data.transaction = newCommit,
+                                               !.data.htlcTransactions = HTLCTransactions]
+            /\ Vars' = [Vars EXCEPT !.CurrentOtherCommitTX = newCommit,
+                                    !.CurrentOtherHTLCTransactionIds = {tx.id : tx \in HTLCTransactions},
+                                    !.PendingOldOtherCommitTxIds = @ \cup {Vars.CurrentOtherCommitTX.id} \cup Vars.CurrentOtherHTLCTransactionIds,
+                                    !.OutgoingHTLCs = (@ \ HTLCsToRemove) \cup {[htlc EXCEPT !.state = "SENT-REMOVE"] : htlc \in (HTLCsToRemove \cap Vars.OutgoingHTLCs)},
+                                    !.IncomingHTLCs = (@ \ HTLCsToRemove) \cup {[htlc EXCEPT !.state = "SENT-REMOVE"] : htlc \in (HTLCsToRemove \cap Vars.IncomingHTLCs)},
+                                    !.OtherOldRKey = Vars.OtherRKey,
+                                    !.OtherRKey = Vars.OtherNewRKey]
     /\ UNCHANGED <<Inventory, LedgerTx, Balance, PendingBalance>>
     /\ UNCHANGED UnchangedVars
     
@@ -439,12 +445,12 @@ CloseChannel ==
         /\ LET signedTx == SignTransaction(tx)
            IN Ledger!PublishTx(signedTx)
         /\ LET uncommittedOutgoingHTLCs == {htlc \in Vars.OutgoingHTLCs : ~htlc.hash \in HashesInCommitTransaction(tx) /\ htlc.state \in {"NEW", "SENT-COMMIT"}}
-           IN LET uncommittedIncomingHTLCs == {htlc \in Vars.IncomingHTLCs : ~htlc.hash \in HashesInCommitTransaction(tx) /\ htlc.state \in {"NEW", "SENT-COMMIT"}}
-              IN LET uncommittedOutgoingHTLCAmounts == Ledger!SumAmounts(uncommittedOutgoingHTLCs)
-                 IN /\ Balance' = Balance + uncommittedOutgoingHTLCAmounts
-                    /\ PendingBalance' = PendingBalance - uncommittedOutgoingHTLCAmounts
-                    /\ Vars' = [Vars EXCEPT !.OutgoingHTLCs = (@ \ uncommittedOutgoingHTLCs) \cup {[htlc EXCEPT !.state = "ABORTED"] : htlc \in uncommittedOutgoingHTLCs},
-                                            !.IncomingHTLCs = (@ \ uncommittedIncomingHTLCs) \cup {[htlc EXCEPT !.state = "ABORTED"] : htlc \in uncommittedIncomingHTLCs} ]
+               uncommittedIncomingHTLCs == {htlc \in Vars.IncomingHTLCs : ~htlc.hash \in HashesInCommitTransaction(tx) /\ htlc.state \in {"NEW", "SENT-COMMIT"}}
+               uncommittedOutgoingHTLCAmounts == Ledger!SumAmounts(uncommittedOutgoingHTLCs)
+           IN /\ Balance' = Balance + uncommittedOutgoingHTLCAmounts
+              /\ PendingBalance' = PendingBalance - uncommittedOutgoingHTLCAmounts
+              /\ Vars' = [Vars EXCEPT !.OutgoingHTLCs = (@ \ uncommittedOutgoingHTLCs) \cup {[htlc EXCEPT !.state = "ABORTED"] : htlc \in uncommittedOutgoingHTLCs},
+                                      !.IncomingHTLCs = (@ \ uncommittedIncomingHTLCs) \cup {[htlc EXCEPT !.state = "ABORTED"] : htlc \in uncommittedIncomingHTLCs} ]
     /\ UNCHANGED <<Message, Inventory, TIOUsedTransactionIds>>
     /\ UNCHANGED UnchangedVars
     
@@ -456,11 +462,11 @@ NoteThatOtherPartyClosedHonestly ==
         \/ Cardinality(Vars.PendingOldOtherCommitTxIds \cap Ledger!LedgerTxIds) > 0
     /\ State' = "closed"
     /\ LET closingTx == CHOOSE tx \in LedgerTx : tx.id \in Vars.PendingOldOtherCommitTxIds \/ ("id" \in DOMAIN Vars.CurrentOtherCommitTX /\ tx.id = Vars.CurrentOtherCommitTX.id)
-       IN LET uncommittedOutgoingHTLCs == {htlc \in Vars.OutgoingHTLCs : ~htlc.hash \in HashesInCommitTransaction(closingTx) /\ htlc.state \in {"NEW", "RECV-COMMIT", "SENT-COMMIT", "PENDING-COMMIT"}}
-          IN LET uncommittedOutgoingHTLCAmounts == Ledger!SumAmounts(uncommittedOutgoingHTLCs)
-             IN /\ Balance' = Balance + uncommittedOutgoingHTLCAmounts
-                /\ PendingBalance' = PendingBalance - uncommittedOutgoingHTLCAmounts
-                /\ Vars' = [Vars EXCEPT !.OutgoingHTLCs = (@ \ uncommittedOutgoingHTLCs) \cup {[htlc EXCEPT !.state = "ABORTED"] : htlc \in uncommittedOutgoingHTLCs} ]
+           uncommittedOutgoingHTLCs == {htlc \in Vars.OutgoingHTLCs : ~htlc.hash \in HashesInCommitTransaction(closingTx) /\ htlc.state \in {"NEW", "RECV-COMMIT", "SENT-COMMIT", "PENDING-COMMIT"}}
+           uncommittedOutgoingHTLCAmounts == Ledger!SumAmounts(uncommittedOutgoingHTLCs)
+       IN /\ Balance' = Balance + uncommittedOutgoingHTLCAmounts
+          /\ PendingBalance' = PendingBalance - uncommittedOutgoingHTLCAmounts
+          /\ Vars' = [Vars EXCEPT !.OutgoingHTLCs = (@ \ uncommittedOutgoingHTLCs) \cup {[htlc EXCEPT !.state = "ABORTED"] : htlc \in uncommittedOutgoingHTLCs} ]
     /\ UNCHANGED <<Message, Inventory, LedgerTx, TIOUsedTransactionIds>>
     /\ UNCHANGED UnchangedVars
     
@@ -514,8 +520,8 @@ MyPossibleTxInputs(parentSet) ==
 MyPossibleTxOutputs(parentId, amount) == [parentId: {parentId}, outputId: {1}, amount: {amount}, conditions: {{[type |-> SingleSignature, data |-> [keys |-> {Vars.MyKey}], absTimelock |-> 0, relTimelock |-> 0]}}]
 MyPossibleNewTransactions(parentSet) == 
     LET txId == TIO!GetNewTransactionId
-    IN LET txInputs == MyPossibleTxInputs(parentSet)
-       IN IF txInputs = {} 
+        txInputs == MyPossibleTxInputs(parentSet)
+    IN IF txInputs = {} 
           THEN {}
           ELSE [id: {txId}, inputs: {txInputs}, outputs: Subset1(MyPossibleTxOutputs(txId, Ledger!AmountSpentByInputs(txInputs)))]
 MyPossibleNewTransactionsWithoutOwnParents(parentSet) ==
@@ -566,17 +572,17 @@ RedeemHTLCAfterClose ==
                                     /\ input.parentId = commitmentTx.id
                                     /\ input.outputId = output.outputId
                                     /\ LET isSuccessTransaction == \E condition \in output.conditions : condition.type = AllSigHashLock
-                                       IN \* validTransaction adds the corresponding preimage to an existing HTLC success transaction 
-                                       /\ LET validTransaction == IF isSuccessTransaction
+                                           \* validTransaction adds the corresponding preimage to an existing HTLC success transaction 
+                                           validTransaction == IF isSuccessTransaction
                                                                   THEN [signedTransaction EXCEPT !.inputs = {[inp EXCEPT !.witness = [signatures |-> inp.witness.signatures, preimage |-> htlc.hash]] : inp \in @}]
                                                                   ELSE signedTransaction
-                                          IN /\ Ledger!PublishTx(validTransaction)
-                                             /\ Vars' = [Vars EXCEPT !.IncomingHTLCs = IF htlc \in Vars.IncomingHTLCs THEN (@ \ {htlc}) \cup {[htlc EXCEPT !.state = IF isSuccessTransaction THEN "FULFILLED" ELSE "TIMEDOUT"]} ELSE @, \* TODO only timeout fulfill incoming and 
-                                                                     !.OutgoingHTLCs = IF htlc \in Vars.OutgoingHTLCs THEN (@ \ {htlc}) \cup {[htlc EXCEPT !.state = IF isSuccessTransaction THEN "FULFILLED" ELSE "TIMEDOUT"]} ELSE @  \* timeout outgoing? TODO
-                                                        ]
-                                             \* Change balance only if HTLC has not already been fulfilled
-                                             /\ Balance' = Balance + IF ((isSuccessTransaction /\ htlc \in Vars.IncomingHTLCs) \/ ~isSuccessTransaction) /\ ~htlc.state \in {"FULFILLED", "SENT-REMOVE"} THEN htlc.amount ELSE 0
-                                             /\ PendingBalance' = PendingBalance - IF ((isSuccessTransaction /\ htlc \in Vars.IncomingHTLCs) \/ ~isSuccessTransaction) /\ ~htlc.state \in {"FULFILLED", "SENT-REMOVE"} THEN htlc.amount ELSE 0
+                                       IN   /\ Ledger!PublishTx(validTransaction)
+                                            /\ Vars' = [Vars EXCEPT !.IncomingHTLCs = IF htlc \in Vars.IncomingHTLCs THEN (@ \ {htlc}) \cup {[htlc EXCEPT !.state = IF isSuccessTransaction THEN "FULFILLED" ELSE "TIMEDOUT"]} ELSE @, \* TODO only timeout fulfill incoming and 
+                                                                    !.OutgoingHTLCs = IF htlc \in Vars.OutgoingHTLCs THEN (@ \ {htlc}) \cup {[htlc EXCEPT !.state = IF isSuccessTransaction THEN "FULFILLED" ELSE "TIMEDOUT"]} ELSE @  \* timeout outgoing? TODO
+                                                       ]
+                                            \* Change balance only if HTLC has not already been fulfilled
+                                            /\ Balance' = Balance + IF ((isSuccessTransaction /\ htlc \in Vars.IncomingHTLCs) \/ ~isSuccessTransaction) /\ ~htlc.state \in {"FULFILLED", "SENT-REMOVE"} THEN htlc.amount ELSE 0
+                                            /\ PendingBalance' = PendingBalance - IF ((isSuccessTransaction /\ htlc \in Vars.IncomingHTLCs) \/ ~isSuccessTransaction) /\ ~htlc.state \in {"FULFILLED", "SENT-REMOVE"} THEN htlc.amount ELSE 0
     /\ UNCHANGED <<State, Message, Inventory>>
     /\ UNCHANGED UnchangedVars
     
@@ -610,9 +616,9 @@ Punish ==
         /\ TIO!MarkAsUsed(tx.id)
         /\ Ledger!PublishTx(tx)
         /\ LET parent == CHOOSE parent \in LedgerTx : \E input \in tx.inputs : parent.id = input.parentId \* This assumes that the revocation transaction has only one parent
-           IN LET spentParent == [parent EXCEPT !.outputs = {output \in @ : \E input \in tx.inputs : input.parentId = parent.id /\ input.outputId = output.outputId}]
-              IN LET punishedHashes == HashesInCommitTransaction(spentParent)
-                 IN Vars' = [Vars EXCEPT !.HavePunished = TRUE]
+               spentParent == [parent EXCEPT !.outputs = {output \in @ : \E input \in tx.inputs : input.parentId = parent.id /\ input.outputId = output.outputId}]
+               punishedHashes == HashesInCommitTransaction(spentParent)
+           IN Vars' = [Vars EXCEPT !.HavePunished = TRUE]
     /\ State' = "closed"
     /\ UNCHANGED <<Message, Inventory, Balance, PendingBalance>>
     /\ UNCHANGED UnchangedVars
@@ -645,5 +651,5 @@ Next ==
 
 =============================================================================
 \* Modification History
-\* Last modified Fri Sep 24 18:45:03 CEST 2021 by matthias
+\* Last modified Mon Sep 27 15:51:09 CEST 2021 by matthias
 \* Created Tue Apr 13 11:49:06 CEST 2021 by matthias
